@@ -1,0 +1,38 @@
+# Runtime state and lab output — never commit these
+*.log
+logs/
+results/
+scans/
+captures/
+evidence/
+
+# Packet captures (can contain third-party traffic / real hostnames)
+*.pcap
+*.pcapng
+*.cap
+
+# Scan artifacts
+*.nmap
+*.gnmap
+*.xml
+nmap-*
+scan-*
+
+# Local environment and secrets
+.env
+.env.*
+.venv/
+venv/
+*.pem
+*.key
+*.crt
+id_rsa*
+*.kdbx
+credentials*
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

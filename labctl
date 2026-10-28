@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# labctl — control the local, isolated network-exploitation lab.
+#
+# Everything runs in rootless podman on a private network with NO published
+# ports. The victim is reachable only from containers on the `hslab` network.
+#
+#   ./labctl start      start victim + attacker
+#   ./labctl stop       stop and remove everything (containers + network)
+#   ./labctl status     show containers, IPs, open ports
+#   ./labctl hexstrike  start the HexStrike API bound to 127.0.0.1:8888
+#   ./labctl scan       nmap the victim from the attacker container
+#   ./labctl shell      drop into the attacker container
+#   ./labctl victim-ip  print the victim's address on the lab network
+#
+set -euo pipefail
+
+NET=hslab
+VICTIM=hslab-victim
+ATTACKER=hslab-attacker
+HEXSTRIKE=hslab-hexstrike
+IMAGE_ATTACKER=hexstrike-kali:latest
+IMAGE_VICTIM=docker.io/tleemcjr/metasploitable2
+HS_PORT=8888
+
+vip() {
+    podman inspect "$VICTIM" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null
+}
+
+start() {
+    podman network exists "$NET" 2>/dev/null || podman network create "$NET" >/dev/null
+    if ! podman container exists "$VICTIM" 2>/dev/null; then
+        # -dit matters: the image's CMD ends in `bash`, which exits without a TTY.
+        podman run -dit --name "$VICTIM" --network "$NET" "$IMAGE_VICTIM" >/dev/null
+        echo "victim: starting (services take ~15s)"
+    fi
+    if ! podman container exists "$ATTACKER" 2>/dev/null; then
+        podman run -dit --name "$ATTACKER" --network "$NET" \
+            --entrypoint /bin/bash "$IMAGE_ATTACKER" >/dev/null
+        echo "attacker: started"
+    fi
+    sleep 15
+    status
+}
+
+stop() {
+    # HexStrike holds port 8888 and sits on $NET — remove it before the network,
+    # otherwise `network rm` fails and the unauthenticated API survives teardown.
+    for c in "$HEXSTRIKE" "$ATTACKER" "$VICTIM"; do
+        podman rm -f "$c" >/dev/null 2>&1 || true
+    done
+    podman network rm "$NET" >/dev/null 2>&1 || true
+    echo "lab down"
+}
+
+status() {
+    echo "--- containers ---"
+    podman ps --filter "network=$NET" --format '  {{.Names}}\t{{.Status}}'
+    local ip; ip=$(vip)
+    echo "--- victim ip: ${ip:-<none>} ---"
+    if [ -n "$ip" ]; then
+        echo "--- reachable ports (from inside the lab only) ---"
+        podman exec "$ATTACKER" bash -c '
+            for p in 21 22 23 25 80 139 445 3306 5432 8180; do
+                (echo >/dev/tcp/'"$ip"'/$p) 2>/dev/null && echo "  open: $p"
+            done' || true
+    fi
+}
+
+hexstrike() {
+    # /api/command executes arbitrary shell commands with NO auth.
+    # Bind to loopback only — never 0.0.0.0.
+    podman rm -f "$HEXSTRIKE" >/dev/null 2>&1 || true
+    # Mount the host's Go-built tools (httpx, nuclei, katana, ffuf, gau, subfinder,
+    # dalfox) so HexStrike's tool detection sees them too. Read-only — but note
+    # anything here is readable via /api/command, so keep it non-sensitive.
+    podman run -d --name "$HEXSTRIKE" --network "$NET" \
+        -p 127.0.0.1:${HS_PORT}:${HS_PORT} \
+        -v "$HOME/.local/bin:/opt/hostbin:ro" \
+        -e PATH="/opt/hostbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        "$IMAGE_ATTACKER" >/dev/null
+    sleep 4
+    curl -fsS "http://127.0.0.1:${HS_PORT}/health" && echo
+    echo "HexStrike: http://127.0.0.1:${HS_PORT}  (attacker tools: $(podman exec "$HEXSTRIKE" bash -c 'ls /usr/bin | grep -cE "^(nmap|sqlmap|hydra|gobuster|dirb)$"') )"
+}
+
+scan() {
+    local ip; ip=$(vip)
+    [ -n "$ip" ] || { echo "victim not running"; exit 1; }
+    # -sT: rootless containers lack CAP_NET_RAW, so no SYN scan.
+    podman exec "$ATTACKER" nmap -sT -sV -Pn -p 21,22,23,25,80,139,445,3306,3632,5432,8180 "$ip"
+}
+
+case "${1:-}" in
+    start)     start ;;
+    stop)      stop ;;
+    status)    status ;;
+    hexstrike) hexstrike ;;
+    scan)      scan ;;
+    shell)     podman exec -it "$ATTACKER" /bin/bash ;;
+    victim-ip) vip ;;
+    *) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0" ;;
+esac
